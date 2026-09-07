@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <algorithm>
-#include <limits>
 
 #include "eagle3_strategy.hpp"
 #include "openvino/pass/pa_kv_reorder_fusion.hpp"
@@ -23,9 +22,10 @@ ContinuousBatchingPipeline::Eagle3DecodingImpl::Eagle3DecodingImpl(const ov::gen
     OPENVINO_ASSERT(main_model && draft_model);
     // SDPAToPagedAttention replaces stateful ReadValue nodes with cache parameters, while
     // get_cache_types() recognizes the pre-conversion stateful representation.
-    const bool main_has_linear_attention = utils::get_cache_types(*main_model).has_linear();
     const bool draft_has_linear_attention = utils::get_cache_types(*draft_model).has_linear();
 
+    // Paged attention and paged recurrent linear-attention operations consume the same tree mask
+    // during Eagle3 TopK validation.
     ov::genai::ModelDesc main_model_desc_with_qq_bias = main_model_desc;
     main_model_desc_with_qq_bias.properties["query_to_query_bias"] = true;
     auto scheduler_configs = init_speculative_models(main_model_desc_with_qq_bias, draft_model_desc);
@@ -36,17 +36,6 @@ ContinuousBatchingPipeline::Eagle3DecodingImpl::Eagle3DecodingImpl(const ov::gen
         m_vision_registry = std::make_shared<VisionRegistry>();
     }
 
-    if (!scheduler_configs.first.enable_prefix_caching && main_has_linear_attention) {
-        const size_t num_assistant_tokens =
-            std::max(main_model_desc.generation_config.num_assistant_tokens.value_or(size_t{5}), size_t{5});
-        OPENVINO_ASSERT(num_assistant_tokens <= std::numeric_limits<size_t>::max() - 2,
-                        "Eagle3 num_assistant_tokens is too large for linear attention checkpoint allocation.");
-        // One block holds the committed recurrent state; the main validation pass needs one
-        // temporary checkpoint for the seed token and one for each draft candidate.
-        scheduler_configs.first.num_linear_attention_blocks = std::max(
-            scheduler_configs.first.num_linear_attention_blocks,
-            num_assistant_tokens + 2);
-    }
     if (!draft_has_linear_attention) {
         scheduler_configs.second.num_linear_attention_blocks = 0;
     }
