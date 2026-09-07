@@ -80,6 +80,7 @@ std::vector<EncodedGenerationResult> generate_common(
         if (position_ids.has_value() && self->m_inputs_embedder) {
             const auto [position_ids_tensor, rope_delta] = (*position_ids)[rid];
             self->m_inputs_embedder->set_position_ids(position_ids_tensor);
+            // TODO: The rope_delta here has to be recomputed, if rope_delta is not provided then a stale value is used
             if (rope_delta.has_value()) {
                 self->m_inputs_embedder->set_rope_delta(*rope_delta);
             }
@@ -157,6 +158,7 @@ std::vector<EncodedGenerationResult> generate_common(
         self->perf_metrics().raw_metrics.generate_durations.clear();
         self->perf_metrics().raw_metrics.generate_durations.emplace_back(generate_duration_us);
         self->perf_metrics().num_input_tokens = request->get_prompt_len();
+        self->perf_metrics().num_prefix_cache_hit_tokens = request->get_num_prefix_cache_hit_tokens();
         self->perf_metrics().evaluate_statistics(t_start);
 
         result.perf_metrics = self->perf_metrics();
@@ -185,12 +187,17 @@ protected:
         m_draft_pipeline->raw_perf_metrics.m_inference_durations = {{ MicroSeconds(0.0f) }};
     }
 
+    static int64_t compute_rope_delta(const ov::Tensor& position_ids);
     void drop_requests();
     virtual void align_request_pair_processed_prefix(uint64_t) {}
     virtual void prepare_main_validation(const GeneratedRequests&,
                                          const std::map<int64_t, UpdateRequestResult>&) {}
     virtual void finalize_main_validation(const GeneratedRequests&) {}
     virtual void abort_main_validation() {}
+    virtual void validate_awaiting_requests(const std::vector<SequenceGroup::Ptr>& main_awaiting_requests,
+                                            const std::vector<SequenceGroup::Ptr>& draft_awaiting_requests) const {
+        OPENVINO_ASSERT(main_awaiting_requests.size() == draft_awaiting_requests.size());
+    }
     bool is_requests_empty();
     std::vector<SequenceGroup::Ptr> get_awaiting_requests();
     std::pair<ov::genai::SchedulerConfig, ov::genai::SchedulerConfig> init_speculative_models(const ov::genai::ModelDesc& main_model_desc, const ov::genai::ModelDesc& draft_model_desc);

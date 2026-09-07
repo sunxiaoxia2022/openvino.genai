@@ -25,7 +25,6 @@ ContinuousBatchingPipeline::Eagle3DecodingImpl::Eagle3DecodingImpl(const ov::gen
     // get_cache_types() recognizes the pre-conversion stateful representation.
     const bool main_has_linear_attention = utils::get_cache_types(*main_model).has_linear();
     const bool draft_has_linear_attention = utils::get_cache_types(*draft_model).has_linear();
-    m_main_has_linear_attention = main_has_linear_attention;
 
     ov::genai::ModelDesc main_model_desc_with_qq_bias = main_model_desc;
     main_model_desc_with_qq_bias.properties["query_to_query_bias"] = true;
@@ -38,7 +37,8 @@ ContinuousBatchingPipeline::Eagle3DecodingImpl::Eagle3DecodingImpl(const ov::gen
     }
 
     if (!scheduler_configs.first.enable_prefix_caching && main_has_linear_attention) {
-        const size_t num_assistant_tokens = std::max(main_model_desc.generation_config.num_assistant_tokens, size_t{5});
+        const size_t num_assistant_tokens =
+            std::max(main_model_desc.generation_config.num_assistant_tokens.value_or(size_t{5}), size_t{5});
         OPENVINO_ASSERT(num_assistant_tokens <= std::numeric_limits<size_t>::max() - 2,
                         "Eagle3 num_assistant_tokens is too large for linear attention checkpoint allocation.");
         // One block holds the committed recurrent state; the main validation pass needs one
@@ -110,26 +110,27 @@ ContinuousBatchingPipeline::Eagle3DecodingImpl::Eagle3DecodingImpl(const ov::gen
     ov::genai::ModelDesc kv_model_desc;
     kv_model_desc.model = kv_model;
     kv_model_desc.device = std::move(main_device);
+    // as of now, only kv cache information is needed for kv update model
+    if (main_model_desc.properties.count(ov::hint::kv_cache_precision.name()) > 0) {
+        kv_model_desc.properties[ov::hint::kv_cache_precision.name()] =
+            main_model_desc.properties.at(ov::hint::kv_cache_precision.name());
+    } else {
+        GENAI_INFO("kv cache precision not specified in main model properties. Leave to the plugin for default precision.");
+    }
 
-    // Read the KV cache precision from the compiled main model's key_cache input port rather than
-    // the ov::hint::kv_cache_precision property: plugins may resolve the actual cache precision
-    // (e.g. CPU promoting to bf16 based on inference precision) independently of that hint, and the
-    // reorder model must match the precision of the tensors actually bound by the scheduler.
-    auto kv_cache_precision = m_main_pipeline->get_kv_cache_element_type();
+    // Read the runtime KV cache precision from the compiled main model's key_cache input port: plugins may resolve the
+    // actual cache precision independently of that hint (e.g. CPU promoting to bf16 when kv cache precision hint is
+    // fp16, GPU promoting to i8 when kv cache precision hint is u8, and for GPU, when the hint is u4, the kv data are
+    // packed as uint8 and be reinterpreted to u4 inside plugin), and the reorder model must match the precision of the
+    // tensors actually bound by the runtime.
+    const auto rt_kv_cache_precision = m_main_pipeline->get_kv_cache_element_type();
+    const auto kv_cache_precision =
+        m_main_pipeline->get_model_property(ov::hint::kv_cache_precision.name()).as<ov::element::Type>();
     // transformation for kv update model: u4 KV cache is stored as u8 internally,
     // so the reorder pass operates on u8 while the original precision is preserved in rt_info.
     kv_model->set_rt_info(kv_cache_precision, "auxiliary_kv_cache_precision");
-    if (kv_cache_precision == ov::element::u4) {
-        kv_cache_precision = ov::element::u8;
-    }
-    ov::pass::PaKVReorderFusion(kv_cache_precision).run_on_model(kv_model);
-    // Pass the resolved (post u4->u8) precision explicitly instead of forwarding the raw
-    // ov::hint::kv_cache_precision value from main_model_desc.properties: for u4 caches that raw
-    // value would still say "u4" while PaKVReorderFusion above already rewrote the key_cache./
-    // value_cache. parameters to u8, and some plugins (e.g. GPU) give an explicitly user-set
-    // kv_cache_precision property priority over the auxiliary_kv_cache_precision rt_info, which
-    // would reintroduce a precision mismatch between the property and the actual parameter type.
-    kv_model_desc.properties[ov::hint::kv_cache_precision.name()] = kv_cache_precision;
+    ov::pass::PaKVReorderFusion(rt_kv_cache_precision).run_on_model(kv_model);
+
     m_kv_update_wrapper = std::make_shared<KVUpdateWrapper>(kv_model_desc);
 
     m_perf_metrics = ov::genai::SDPerModelsPerfMetrics();
@@ -219,6 +220,30 @@ void ContinuousBatchingPipeline::Eagle3DecodingImpl::align_request_pair_processe
     }
 }
 
+void ContinuousBatchingPipeline::Eagle3DecodingImpl::validate_awaiting_requests(
+    const std::vector<SequenceGroup::Ptr>& main_awaiting_requests,
+    const std::vector<SequenceGroup::Ptr>& draft_awaiting_requests) const {
+    size_t expected_draft_requests = 0;
+
+    for (const auto& request : main_awaiting_requests) {
+        OPENVINO_ASSERT(request, "Eagle3 main awaiting request pointer is null.");
+
+        const auto& sampling_params = request->get_sampling_parameters();
+        const bool is_main_only =
+            sampling_params.num_assistant_tokens.has_value() && sampling_params.num_assistant_tokens.value() == 0;
+        if (!is_main_only) {
+            ++expected_draft_requests;
+        }
+    }
+
+    OPENVINO_ASSERT(draft_awaiting_requests.size() == expected_draft_requests,
+                    "Eagle3 awaiting request mismatch: draft queue size is ",
+                    draft_awaiting_requests.size(),
+                    ", but expected ",
+                    expected_draft_requests,
+                    " (number of main requests with speculative decoding enabled).");
+}
+
 void ContinuousBatchingPipeline::Eagle3DecodingImpl::prepare_main_validation(
     const GeneratedRequests& main_generated_requests_before_validation,
     const std::map<int64_t, UpdateRequestResult>& update_sequence_info) {
@@ -254,7 +279,7 @@ void ContinuousBatchingPipeline::Eagle3DecodingImpl::finalize_main_validation(
 
         const auto generated_request_it = main_generated_requests.find(request_id);
         if (generated_request_it == main_generated_requests.end()) {
-            m_main_pipeline->release_linear_attention_checkpoints_for_sequence(checkpoint_sequence_id);
+            m_main_pipeline->release_linear_attention_checkpoints_for_sequence(checkpoint_sequence_id.value());
             continue;
         }
 
@@ -273,7 +298,7 @@ void ContinuousBatchingPipeline::Eagle3DecodingImpl::finalize_main_validation(
                             checkpoint_slot,
                             ", reserved_checkpoints=",
                             validation_candidate_count + 1);
-            m_main_pipeline->promote_linear_attention_checkpoint_for_sequence(checkpoint_sequence_id, checkpoint_slot);
+            m_main_pipeline->promote_linear_attention_checkpoint_for_sequence(checkpoint_sequence_id.value(), checkpoint_slot);
             continue;
         }
 
@@ -283,7 +308,7 @@ void ContinuousBatchingPipeline::Eagle3DecodingImpl::finalize_main_validation(
                                                             : before_validation_it->second;
         const size_t generated_length_after_validation = generated_sequence.token_ids.size();
         if (generated_length_after_validation <= generated_length_before_validation) {
-            m_main_pipeline->release_linear_attention_checkpoints_for_sequence(checkpoint_sequence_id);
+            m_main_pipeline->release_linear_attention_checkpoints_for_sequence(checkpoint_sequence_id.value());
             continue;
         }
 
@@ -292,7 +317,7 @@ void ContinuousBatchingPipeline::Eagle3DecodingImpl::finalize_main_validation(
         const size_t generated_by_main = generated_length_after_validation - generated_length_before_validation;
         const size_t accepted_draft_tokens = std::min(validation_candidate_count, generated_by_main - 1);
         const size_t checkpoint_slot = accepted_draft_tokens + 1;
-        m_main_pipeline->promote_linear_attention_checkpoint_for_sequence(checkpoint_sequence_id, checkpoint_slot);
+        m_main_pipeline->promote_linear_attention_checkpoint_for_sequence(checkpoint_sequence_id.value(), checkpoint_slot);
     }
 
     m_linear_attention_checkpoint_sequences.clear();
@@ -302,7 +327,9 @@ void ContinuousBatchingPipeline::Eagle3DecodingImpl::finalize_main_validation(
 
 void ContinuousBatchingPipeline::Eagle3DecodingImpl::abort_main_validation() {
     for (const auto& [_, checkpoint_sequence_id] : m_linear_attention_checkpoint_sequences) {
-        m_main_pipeline->release_linear_attention_checkpoints_for_sequence(checkpoint_sequence_id);
+        if (checkpoint_sequence_id.has_value()) {
+            m_main_pipeline->release_linear_attention_checkpoints_for_sequence(checkpoint_sequence_id.value());
+        }
     }
 
     m_linear_attention_checkpoint_sequences.clear();
@@ -342,10 +369,16 @@ ContinuousBatchingPipeline::Eagle3DecodingImpl::add_request(uint64_t request_id,
                                                                  std::optional<ov::Tensor> prompt_ids,
                                                                  std::optional<std::unordered_map<std::string, ov::Tensor>> lm_extra_inputs) {
     std::lock_guard<std::mutex> lock(m_draft_generations_mutex);
-    OPENVINO_ASSERT(!m_main_has_linear_attention || !sampling_params.is_tree_search(),
-                    "Eagle3 tree search is not supported for models with linear attention. "
-                    "Tree validation flattens sibling candidates, but the recurrent linear-attention state "
-                    "must be restored for the accepted branch.");
+    if (sampling_params.num_assistant_tokens.has_value() && sampling_params.num_assistant_tokens.value() == 0) {
+        // No speculative draft for this request: run only the main model.
+        return m_main_pipeline->add_request(request_id,
+                                            input_ids,
+                                            sampling_params,
+                                            token_type_ids,
+                                            prompt_ids,
+                                            lm_extra_inputs);
+    }
+
     auto draft_sampling_params = sampling_params;
     draft_sampling_params.ignore_eos = true;
     draft_sampling_params.stop_strings = {};
@@ -397,10 +430,9 @@ ContinuousBatchingPipeline::Eagle3DecodingImpl::add_request(uint64_t request_id,
 
     std::lock_guard<std::mutex> lock(m_draft_generations_mutex);
 
-    OPENVINO_ASSERT(!m_main_has_linear_attention || !sampling_params.is_tree_search(),
-                    "Eagle3 tree search is not supported for models with linear attention. "
-                    "Tree validation flattens sibling candidates, but the recurrent linear-attention state "
-                    "must be restored for the accepted branch.");
+    if (sampling_params.num_assistant_tokens.has_value() && sampling_params.num_assistant_tokens.value() == 0) {
+        return m_main_pipeline->add_request(request_id, prompt, sampling_params);
+    }
 
     auto draft_sampling_params = sampling_params;
     draft_sampling_params.ignore_eos = true;
@@ -433,7 +465,7 @@ std::vector<EncodedGenerationResult> ContinuousBatchingPipeline::Eagle3DecodingI
                                       ov::Tensor& draft_in) {
         OPENVINO_ASSERT(main_cfg.assistant_confidence_threshold == 0.f,
                         "Eagle3 only supports num_assistant_tokens (assistant_confidence_threshold must be 0.f)");
-        if (main_cfg.num_assistant_tokens == 0) {
+        if (!main_cfg.num_assistant_tokens.has_value()) {
             main_cfg.num_assistant_tokens = m_main_pipeline->default_num_assistant_tokens;
             draft_cfg.num_assistant_tokens = main_cfg.num_assistant_tokens;
         }
@@ -459,19 +491,6 @@ std::vector<EncodedGenerationResult> ContinuousBatchingPipeline::Eagle3DecodingI
     };
 
     return generate_common(this, input_ids, sampling_params, streamer, token_type_ids, position_ids, prompt_ids, lm_extra_inputs_list, strategy);
-}
-
-int64_t ContinuousBatchingPipeline::Eagle3DecodingImpl::compute_rope_delta(const ov::Tensor& position_ids) {
-    const ov::Shape shape = position_ids.get_shape();
-    OPENVINO_ASSERT(shape.size() == 2 || shape.size() == 3,
-                    "Expected position_ids rank 2 or 3 when computing rope_delta.");
-
-    const size_t seq_axis = shape.size() == 3 ? 2 : 1;
-    OPENVINO_ASSERT(shape[seq_axis] > 0, "position_ids sequence length must be greater than 0.");
-
-    const int64_t* data = position_ids.data<const int64_t>();
-    const int64_t max_position_id = *std::max_element(data, data + position_ids.get_size());
-    return max_position_id + 1 - static_cast<int64_t>(shape[seq_axis]);
 }
 
 ov::Tensor ContinuousBatchingPipeline::Eagle3DecodingImpl::trim_first_token_sequence_tensor(const ov::Tensor& tensor,

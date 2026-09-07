@@ -30,6 +30,12 @@ enum class SequenceGroupType {
     EMBEDDINGS
 };
 
+// Representation of the values stored in the logits tensor passed to the sampler.
+enum class LogitsType {
+    RAW,
+    LOG_PROBS
+};
+
 using TokenIds = std::vector<int64_t>;
 using LogProbs = std::vector<float>;
 
@@ -426,6 +432,7 @@ class SequenceGroup  : public std::enable_shared_from_this<SequenceGroup> {
     size_t m_num_validation_tokens = 0;
     // flag to enable/disable token generation, e.g. in speculative decoding scenario
     bool m_is_gen_paused = false;
+    LogitsType m_logits_type = LogitsType::RAW;
     // output seq len at current iteration
     size_t m_output_seq_len = 0;
 
@@ -863,6 +870,14 @@ public:
         return m_sampling_params;
     }
 
+    LogitsType get_logits_type() const {
+        return m_logits_type;
+    }
+
+    void set_logits_type(LogitsType logits_type) {
+        m_logits_type = logits_type;
+    }
+
     void set_out_of_memory() {
         for (size_t seq_id = 0; seq_id < m_sequences.size(); ++seq_id) {
             if (m_sequences[seq_id]->is_running()) {
@@ -894,6 +909,14 @@ public:
 
     void set_generation_status(GenerationStatus status) {
         m_generation_stream->set_generation_status(status);
+    }
+
+    void set_num_prefix_cache_hit_tokens(size_t num_prefix_cache_hit_tokens) {
+        m_perf_metrics.num_prefix_cache_hit_tokens = num_prefix_cache_hit_tokens;
+    }
+
+    size_t get_num_prefix_cache_hit_tokens() const {
+        return m_perf_metrics.num_prefix_cache_hit_tokens;
     }
 
     void update_perf_metrics(MicroSeconds inference_duration,
